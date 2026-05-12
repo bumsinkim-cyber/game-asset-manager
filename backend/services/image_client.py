@@ -44,3 +44,40 @@ class ImageClient:
                 return base64.b64encode(img_resp.content).decode()
             else:
                 raise ValueError(f"Unexpected response: {img}")
+
+    async def edit(
+        self,
+        api_token: str,
+        image_b64: str,
+        prompt: str,
+        model: str = "gpt-image-1.5",
+        size: str = "1024x1024",
+    ) -> str:
+        """Edit an existing image to apply changes. Returns base64-encoded PNG string."""
+        headers = {"Authorization": f"Bearer {api_token}"}
+        image_bytes = base64.b64decode(image_b64)
+
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            response = await client.post(
+                f"{API_BASE}/openai/v1/images/edits",
+                headers=headers,
+                data={
+                    "prompt": prompt,
+                    "model": model,
+                    "n": "1",
+                    "size": size,
+                },
+                files={"image": ("character.png", image_bytes, "image/png")},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            img = data["data"][0]
+            if "b64_json" in img and img["b64_json"]:
+                return img["b64_json"]
+            elif "url" in img:
+                img_resp = await client.get(img["url"], timeout=60.0)
+                img_resp.raise_for_status()
+                return base64.b64encode(img_resp.content).decode()
+            else:
+                raise ValueError(f"Unexpected response: {img}")

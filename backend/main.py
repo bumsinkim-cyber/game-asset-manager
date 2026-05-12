@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from services.character_builder import CharacterBuilder, ObjectBuilder
+from services.character_builder import CharacterBuilder, ObjectBuilder, EXPRESSIONS
 from services.gif_maker import MOTION_MAKERS
 from services.image_client import ImageClient
 from services.prompt_builder import PromptBuilder
@@ -219,58 +219,91 @@ async def generate_characters(websocket: WebSocket):
         if req.generate_npc:
             jobs.append(("npc", None))
 
-        total = len(jobs)
+        # neutral must be first so base_b64 is populated before derived expressions
+        expr_names = ["neutral"] + [e for e in EXPRESSIONS.keys() if e != "neutral"]
+        total = len(jobs) * len(expr_names)
         done = 0
 
         for char_type, world in jobs:
-            label = char_type if world is None else f"enemy_w{world}"
-            await websocket.send_json(
-                {"type": "progress", "current": done, "total": total, "label": label}
-            )
+            char_label = char_type if world is None else f"enemy_w{world}"
+            base_b64: str | None = None  # neutral/base image for this character
 
-            if char_type == "hero":
-                prompt = char_builder.hero(req.base_theme, req.style_keywords, req.trend_keywords, req.expression)
-            elif char_type == "enemy":
-                prompt = char_builder.enemy(
-                    req.base_theme, world, req.worlds, req.style_keywords, req.trend_keywords, "angry"
-                )
-            else:
-                prompt = char_builder.npc(req.base_theme, req.style_keywords, req.trend_keywords, req.expression)
+            for expr_name in expr_names:
+                await websocket.send_json({
+                    "type": "progress", "current": done, "total": total,
+                    "char_label": char_label, "expression": expr_name,
+                    "label": f"{char_label} · {expr_name}",
+                })
 
-            try:
-                b64 = await image_client.generate(
-                    req.api_token, prompt, req.model, req.size, background="transparent"
-                )
+                if char_type == "hero":
+                    neutral_prompt = char_builder.hero(req.base_theme, req.style_keywords, req.trend_keywords, "neutral")
+                elif char_type == "enemy":
+                    neutral_prompt = char_builder.enemy(req.base_theme, world, req.worlds, req.style_keywords, req.trend_keywords, "neutral")
+                else:
+                    neutral_prompt = char_builder.npc(req.base_theme, req.style_keywords, req.trend_keywords, "neutral")
 
-                png_name = f"{label}.png"
-                with open(os.path.join(sdir, png_name), "wb") as f:
-                    f.write(base64.b64decode(b64))
+                try:
+                    if base_b64 is None:
+                        # Generate the base character (neutral expression)
+                        b64 = await image_client.generate(
+                            req.api_token, neutral_prompt, req.model, req.size, background="transparent"
+                        )
+                        base_b64 = b64
+                        display_prompt = neutral_prompt
+                    else:
+                        # Derive this expression from the base image via image edit
+                        edit_prompt = char_builder.expression_edit_prompt(expr_name)
+                        try:
+                            b64 = await image_client.edit(
+                                req.api_token, base_b64, edit_prompt, req.model, req.size
+                            )
+                            display_prompt = edit_prompt
+                        except Exception as edit_err:
+                            # Fallback: generate independently if edit API is unavailable
+                            print(f"[EDIT FALLBACK] {char_label}/{expr_name}: {edit_err}")
+                            if char_type == "hero":
+                                fallback_prompt = char_builder.hero(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
+                            elif char_type == "enemy":
+                                fallback_prompt = char_builder.enemy(req.base_theme, world, req.worlds, req.style_keywords, req.trend_keywords, expr_name)
+                            else:
+                                fallback_prompt = char_builder.npc(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
+                            b64 = await image_client.generate(
+                                req.api_token, fallback_prompt, req.model, req.size, background="transparent"
+                            )
+                            display_prompt = fallback_prompt
 
-                gif_urls: dict[str, str] = {}
-                motions = [m for m in req.selected_motions if m in MOTION_MAKERS]
-                if not motions:
-                    motions = ["idle"]
-                for motion in motions:
-                    maker = MOTION_MAKERS[motion]
-                    kwargs = {"frames": req.gif_frames, "delay_ms": req.gif_delay} if motion == "idle" else {}
-                    gif_bytes = maker(b64, **kwargs)
-                    gif_name = f"{label}_{motion}.gif"
-                    with open(os.path.join(sdir, gif_name), "wb") as f:
-                        f.write(gif_bytes)
-                    gif_urls[motion] = f"/output/{sid}/{gif_name}"
+                    png_name = f"{char_label}_{expr_name}.png"
+                    with open(os.path.join(sdir, png_name), "wb") as f:
+                        f.write(base64.b64decode(b64))
 
-                done += 1
-                await websocket.send_json(
-                    {"type": "character", "label": label, "char_type": char_type,
-                     "world": world, "prompt": prompt, "current": done, "total": total,
-                     "png_url": f"/output/{sid}/{png_name}",
-                     "gif_urls": gif_urls}
-                )
-            except Exception as e:
-                print(f"[CHAR ERROR] {label}: {e}")
-                await websocket.send_json(
-                    {"type": "error", "label": label, "message": f"{type(e).__name__}: {e}"}
-                )
+                    gif_urls: dict[str, str] = {}
+                    motions = [m for m in req.selected_motions if m in MOTION_MAKERS]
+                    if not motions:
+                        motions = ["idle"]
+                    for motion in motions:
+                        maker = MOTION_MAKERS[motion]
+                        kwargs = {"frames": req.gif_frames, "delay_ms": req.gif_delay} if motion == "idle" else {}
+                        gif_bytes = maker(b64, **kwargs)
+                        gif_name = f"{char_label}_{expr_name}_{motion}.gif"
+                        with open(os.path.join(sdir, gif_name), "wb") as f:
+                            f.write(gif_bytes)
+                        gif_urls[motion] = f"/output/{sid}/{gif_name}"
+
+                    done += 1
+                    await websocket.send_json({
+                        "type": "expression",
+                        "char_label": char_label, "expression": expr_name,
+                        "char_type": char_type, "world": world, "prompt": display_prompt,
+                        "current": done, "total": total,
+                        "png_url": f"/output/{sid}/{png_name}",
+                        "gif_urls": gif_urls,
+                    })
+                except Exception as e:
+                    print(f"[CHAR ERROR] {char_label}/{expr_name}: {e}")
+                    await websocket.send_json({
+                        "type": "error", "char_label": char_label, "expression": expr_name,
+                        "message": f"{type(e).__name__}: {e}",
+                    })
 
         await websocket.send_json({"type": "complete", "total": done, "session_id": sid})
     except WebSocketDisconnect:

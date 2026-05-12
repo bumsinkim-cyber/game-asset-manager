@@ -28,12 +28,20 @@ OBJECT_WORLD_ATMOSPHERE = [
 ]
 
 EXPRESSIONS = {
-    "neutral":    "",
-    "happy":      "happy expression, bright smile, cheerful face",
-    "angry":      "angry expression, fierce face, battle-ready scowl",
-    "sad":        "sad expression, melancholic face, downcast eyes",
-    "surprised":  "surprised expression, wide eyes, shocked open mouth",
-    "determined": "determined expression, focused intense gaze, strong willpower",
+    "neutral":    "neutral expression, calm natural face, resting look",
+    "happy":      "extremely happy expression, wide beaming smile, squinting joyful eyes, bright cheerful face",
+    "angry":      "extremely angry expression, fierce intense scowl, deeply furrowed brows, clenched jaw, furious raging face",
+    "sad":        "very sad expression, drooping downcast eyes, frowning melancholic face, sorrowful look",
+    "surprised":  "very surprised expression, wide open eyes, raised eyebrows, open mouth in shock",
+    "determined": "deeply determined expression, narrowed focused eyes, firm set jaw, intense resolute gaze, strong willpower",
+}
+
+EXPRESSION_EDIT_PROMPTS = {
+    "happy":      "extremely happy expression, wide beaming smile, squinting joyful eyes, bright cheerful face",
+    "angry":      "extremely angry expression, fierce intense scowl, deeply furrowed brows, clenched jaw, furious raging face",
+    "sad":        "very sad expression, drooping downcast eyes, frowning melancholic face, sorrowful look",
+    "surprised":  "very surprised expression, wide open eyes, raised eyebrows, open mouth in shock",
+    "determined": "deeply determined expression, narrowed focused eyes, firm set jaw, intense resolute gaze",
 }
 
 
@@ -41,35 +49,50 @@ class CharacterBuilder:
     def _expr(self, expression: str) -> str:
         return EXPRESSIONS.get(expression, "")
 
+    def expression_edit_prompt(self, expression: str) -> str:
+        expr_desc = EXPRESSION_EDIT_PROMPTS.get(expression, "")
+        return (
+            f"Same 2D game character sprite, identical costume and design, "
+            f"transparent background, {expr_desc}. "
+            "Keep all visual aspects identical except the facial expression."
+        )
+
     def hero(self, theme: str, style: str = "", trend: str = "", expression: str = "neutral") -> str:
-        parts = [f"hero protagonist character, {theme}, brave warrior, main character"]
-        if self._expr(expression):
-            parts.append(self._expr(expression))
+        expr = self._expr(expression)
+        parts = []
+        if expr:
+            parts.append(expr)
+        parts.append(f"hero protagonist character, {theme}, brave warrior, main character")
         parts.append(CHAR_QUALITY)
         if style: parts.append(style)
         if trend: parts.append(trend)
         return ", ".join(p for p in parts if p)
 
     def enemy(self, theme: str, world: int, total_worlds: int,
-              style: str = "", trend: str = "", expression: str = "angry") -> str:
+              style: str = "", trend: str = "", expression: str = "neutral") -> str:
         progress = (world - 1) / max(total_worlds - 1, 1)
         atmosphere = ENEMY_ATMOSPHERE[-1][2]
         for min_p, max_p, atm in ENEMY_ATMOSPHERE:
             if min_p <= progress < max_p:
                 atmosphere = atm
                 break
-        parts = [f"enemy monster character, {theme}, world {world}", atmosphere]
-        if self._expr(expression):
-            parts.append(self._expr(expression))
+        expr = self._expr(expression)
+        parts = []
+        if expr:
+            parts.append(expr)
+        parts.append(f"enemy monster character, {theme}, world {world}")
+        parts.append(atmosphere)
         parts.append(CHAR_QUALITY)
         if style: parts.append(style)
         if trend: parts.append(trend)
         return ", ".join(p for p in parts if p)
 
-    def npc(self, theme: str, style: str = "", trend: str = "", expression: str = "happy") -> str:
-        parts = [f"friendly NPC character, {theme}, merchant or guide, welcoming"]
-        if self._expr(expression):
-            parts.append(self._expr(expression))
+    def npc(self, theme: str, style: str = "", trend: str = "", expression: str = "neutral") -> str:
+        expr = self._expr(expression)
+        parts = []
+        if expr:
+            parts.append(expr)
+        parts.append(f"friendly NPC character, {theme}, merchant or guide, welcoming")
         parts.append(CHAR_QUALITY)
         if style: parts.append(style)
         return ", ".join(p for p in parts if p)
