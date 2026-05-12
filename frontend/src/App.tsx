@@ -24,7 +24,7 @@ const OBJ_TYPE_LABELS: Record<string, string> = {
   obstacle: '장애물/트랩',
 }
 
-type Tab = 'backgrounds' | 'characters' | 'objects'
+type Tab = 'backgrounds' | 'characters' | 'objects' | 'ui'
 
 interface Progress {
   current: number
@@ -75,6 +75,29 @@ const MOTIONS = [
   { value: 'hurt',    label: 'Hurt' },
   { value: 'victory', label: 'Victory' },
 ]
+
+// UI asset types
+const UI_CATEGORIES = [
+  { value: 'bubble', label: '말풍선', items: [{ v: 'dialogue', l: '대화' }, { v: 'thought', l: '생각' }, { v: 'shout', l: '외침' }] },
+  { value: 'button', label: '버튼',   items: [{ v: 'normal', l: '기본' }, { v: 'hover', l: '호버' }, { v: 'disabled', l: '비활성' }] },
+  { value: 'panel',  label: '패널/창', items: [{ v: 'inventory', l: '인벤토리' }, { v: 'popup', l: '팝업' }, { v: 'dialog', l: '대화창' }] },
+  { value: 'hud',    label: 'HUD',    items: [{ v: 'hp_bar', l: 'HP바' }, { v: 'mp_bar', l: 'MP바' }, { v: 'exp_bar', l: 'EXP바' }, { v: 'minimap', l: '미니맵' }] },
+  { value: 'icon',   label: '아이콘', items: [{ v: 'skill', l: '스킬' }, { v: 'item', l: '아이템' }, { v: 'system', l: '시스템' }] },
+]
+
+interface UIResult {
+  category: string; item: string; label: string; itemLabel: string
+  png_url: string | null; prompt: string | null
+  status: 'pending' | 'generating' | 'done' | 'error'; error?: string
+}
+
+function buildUISlots(categories: string[]): UIResult[] {
+  const slots: UIResult[] = []
+  for (const cat of UI_CATEGORIES.filter(c => categories.includes(c.value)))
+    for (const { v, l } of cat.items)
+      slots.push({ category: cat.value, item: v, label: `${cat.value}_${v}`, itemLabel: l, png_url: null, prompt: null, status: 'pending' })
+  return slots
+}
 
 // Object types
 interface ObjResult {
@@ -169,6 +192,15 @@ export default function App() {
   const [isGenObj, setIsGenObj] = useState(false)
   const [objSessionId, setObjSessionId] = useState<string | null>(null)
   const objWs = useRef<WebSocket | null>(null)
+
+  // ── UI Assets ──
+  const [uiCategories, setUiCategories] = useState<string[]>(['bubble', 'button', 'panel', 'hud', 'icon'])
+  const [uiSize, setUiSize] = useState('1024x1024')
+  const [uiAssets, setUiAssets] = useState<UIResult[]>([])
+  const [uiProgress, setUiProgress] = useState<Progress>(idleProgress())
+  const [isGenUI, setIsGenUI] = useState(false)
+  const [uiSessionId, setUiSessionId] = useState<string | null>(null)
+  const uiWs = useRef<WebSocket | null>(null)
 
   // ── Lightbox ──
   const [lightbox, setLightbox] = useState<{ src: string; label: string; prompt?: string | null } | null>(null)
@@ -312,6 +344,41 @@ export default function App() {
     ws.onclose = () => setIsGenObj(false)
   }, [apiToken, baseTheme, styleKeywords, worlds, objTypes, objSize, trendKeywords])
 
+  // ── UI generation ──
+  const startUI = useCallback(() => {
+    if (!apiToken.trim()) { alert('API 토큰을 입력하세요.'); return }
+    if (uiCategories.length === 0) { alert('UI 카테고리를 선택하세요.'); return }
+    const slots = buildUISlots(uiCategories)
+    setUiAssets(slots); setUiSessionId(null); setIsGenUI(true)
+    setUiProgress({ current: 0, total: slots.length, label: '', status: 'generating' })
+    const ws = new WebSocket(`${WS_BASE}/ws/generate-ui`)
+    uiWs.current = ws
+    ws.onopen = () => ws.send(JSON.stringify({
+      base_theme: baseTheme, style_keywords: styleKeywords, api_token: apiToken,
+      model: 'gpt-image-1.5', size: uiSize, trend_keywords: trendKeywords,
+      ui_categories: uiCategories,
+    }))
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data)
+      if (msg.type === 'progress') {
+        setUiProgress(p => ({ ...p, current: msg.current, label: msg.label }))
+        setUiAssets(prev => prev.map(a => a.label === msg.label ? { ...a, status: 'generating' } : a))
+      } else if (msg.type === 'ui_asset') {
+        setUiProgress(p => ({ ...p, current: msg.current }))
+        setUiAssets(prev => prev.map(a => a.label === msg.label
+          ? { ...a, png_url: `${API_BASE}${msg.png_url}`, prompt: msg.prompt, status: 'done' } : a))
+      } else if (msg.type === 'error' && msg.label) {
+        setUiAssets(prev => prev.map(a => a.label === msg.label
+          ? { ...a, status: 'error', error: msg.message } : a))
+      } else if (msg.type === 'complete') {
+        setIsGenUI(false); setUiSessionId(msg.session_id)
+        setUiProgress(p => ({ ...p, status: 'complete', current: msg.total }))
+      }
+    }
+    ws.onerror = () => { setIsGenUI(false); alert('WebSocket 오류.') }
+    ws.onclose = () => setIsGenUI(false)
+  }, [apiToken, baseTheme, styleKeywords, uiCategories, uiSize, trendKeywords])
+
   const bgWorldNums = [...new Set(bgImages.map(i => i.world))].sort((a, b) => a - b)
   const bgWorldGroups = bgWorldNums.map(world => ({
     world, imgs: bgImages.filter(img => img.world === world),
@@ -330,15 +397,22 @@ export default function App() {
   const resetBg   = () => { setBgImages([]);    setBgProgress(idleProgress());   setBgSessionId(null) }
   const resetChar = () => { setCharacters([]);  setCharProgress(idleProgress()); setCharSessionId(null) }
   const resetObj  = () => { setObjects([]);     setObjProgress(idleProgress());  setObjSessionId(null) }
+  const resetUI   = () => { setUiAssets([]);    setUiProgress(idleProgress());   setUiSessionId(null) }
+
+  const toggleUICategory = (cat: string) =>
+    setUiCategories(prev => prev.includes(cat) ? prev.filter(x => x !== cat) : [...prev, cat])
 
   const hasResults = activeTab === 'backgrounds' ? bgImages.length > 0
     : activeTab === 'characters' ? characters.length > 0
-    : objects.length > 0
+    : activeTab === 'objects' ? objects.length > 0
+    : uiAssets.length > 0
 
   const activeProg = activeTab === 'backgrounds' ? bgProgress
-    : activeTab === 'characters' ? charProgress : objProgress
+    : activeTab === 'characters' ? charProgress
+    : activeTab === 'objects' ? objProgress : uiProgress
   const isGenerating = activeTab === 'backgrounds' ? isGenBg
-    : activeTab === 'characters' ? isGenChar : isGenObj
+    : activeTab === 'characters' ? isGenChar
+    : activeTab === 'objects' ? isGenObj : isGenUI
 
   return (
     <div className="flex h-screen bg-gray-950 text-gray-100 overflow-hidden">
@@ -459,6 +533,35 @@ export default function App() {
             </FormSection>
           )}
 
+          {activeTab === 'ui' && (
+            <FormSection title="UI 에셋 설정">
+              <Field label="카테고리 선택">
+                {UI_CATEGORIES.map(cat => (
+                  <label key={cat.value} className="flex items-center gap-2 cursor-pointer py-1">
+                    <input type="checkbox" checked={uiCategories.includes(cat.value)}
+                      onChange={() => toggleUICategory(cat.value)} className="accent-purple-500" />
+                    <span className="text-sm text-gray-300">{cat.label}</span>
+                    <span className="text-[10px] text-gray-600">{cat.items.map(i => i.l).join('·')}</span>
+                  </label>
+                ))}
+              </Field>
+              <Field label="이미지 크기">
+                {[{ label: '1024×1024 (권장)', value: '1024x1024' }, { label: '1792×1024 (가로)', value: '1792x1024' }].map(s => (
+                  <button key={s.value} onClick={() => setUiSize(s.value)}
+                    className={`w-full text-left text-sm px-3 py-1.5 rounded border mb-1 transition-colors ${
+                      uiSize === s.value ? 'border-purple-500 bg-purple-900/30 text-purple-300' : 'border-gray-700 text-gray-400 hover:border-gray-500'}`}>
+                    {s.label}
+                  </button>
+                ))}
+              </Field>
+              <p className="text-xs text-gray-500">
+                총 <span className="text-purple-400 font-bold">
+                  {UI_CATEGORIES.filter(c => uiCategories.includes(c.value)).reduce((s, c) => s + c.items.length, 0)}
+                </span>장
+              </p>
+            </FormSection>
+          )}
+
           {activeTab === 'objects' && (
             <FormSection title="오브젝트 설정">
               <Field label="오브젝트 타입 선택">
@@ -489,23 +592,24 @@ export default function App() {
         {/* Action buttons */}
         <div className="p-4 border-t border-gray-800 space-y-2 shrink-0">
           {isGenerating ? (
-            <button onClick={() => { bgWs.current?.close(); charWs.current?.close(); objWs.current?.close() }}
+            <button onClick={() => { bgWs.current?.close(); charWs.current?.close(); objWs.current?.close(); uiWs.current?.close() }}
               className="w-full bg-red-800 hover:bg-red-700 rounded-lg px-4 py-2.5 font-semibold transition-colors">
               ⏹ 생성 중단
             </button>
           ) : (
             <button
-              onClick={activeTab === 'backgrounds' ? startBg : activeTab === 'characters' ? startChar : startObj}
+              onClick={activeTab === 'backgrounds' ? startBg : activeTab === 'characters' ? startChar : activeTab === 'objects' ? startObj : startUI}
               disabled={!baseTheme.trim() || !apiToken.trim()}
               className="w-full bg-purple-700 hover:bg-purple-600 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg px-4 py-2.5 font-semibold transition-colors">
               {activeTab === 'backgrounds' && `▶ 배경 생성 (${worlds * stagesPerWorld}장)`}
               {activeTab === 'characters' && `▶ 캐릭터 생성`}
               {activeTab === 'objects' && `▶ 오브젝트 생성 (${objTypes.length * worlds}장)`}
+              {activeTab === 'ui' && `▶ UI 에셋 생성`}
             </button>
           )}
           {!isGenerating && (() => {
-            const sid = activeTab === 'backgrounds' ? bgSessionId : activeTab === 'characters' ? charSessionId : objSessionId
-            const reset = activeTab === 'backgrounds' ? resetBg : activeTab === 'characters' ? resetChar : resetObj
+            const sid = activeTab === 'backgrounds' ? bgSessionId : activeTab === 'characters' ? charSessionId : activeTab === 'objects' ? objSessionId : uiSessionId
+            const reset = activeTab === 'backgrounds' ? resetBg : activeTab === 'characters' ? resetChar : activeTab === 'objects' ? resetObj : resetUI
             return (
               <div className="flex gap-2">
                 {sid && (
@@ -534,6 +638,7 @@ export default function App() {
             { id: 'backgrounds', label: '배경' },
             { id: 'characters', label: '캐릭터' },
             { id: 'objects', label: '오브젝트' },
+            { id: 'ui', label: 'UI 에셋' },
           ] as { id: Tab; label: string }[]).map(({ id, label }) => (
             <button key={id} onClick={() => setActiveTab(id)}
               className={`px-6 py-3 text-sm font-medium border-b-2 transition-colors ${
@@ -606,6 +711,35 @@ export default function App() {
                 )}
               </div>
             ) : <EmptyState icon="🧙" title="캐릭터 생성" sub="PNG + Idle GIF 애니메이션을 함께 생성합니다" />
+          )}
+
+          {/* ── UI Assets tab ── */}
+          {activeTab === 'ui' && (
+            uiAssets.length > 0 ? (
+              <div className="space-y-8">
+                {UI_CATEGORIES.filter(cat => uiAssets.some(a => a.category === cat.value)).map(cat => (
+                  <div key={cat.value}>
+                    <div className="flex items-center gap-3 mb-3">
+                      <h2 className="text-sm font-semibold text-gray-300 whitespace-nowrap">{cat.label}</h2>
+                      <div className="flex-1 h-px bg-gray-800" />
+                      <span className="text-xs text-gray-600 font-mono">
+                        {uiAssets.filter(a => a.category === cat.value && a.status === 'done').length}/{uiAssets.filter(a => a.category === cat.value).length}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-4 gap-3">
+                      {uiAssets.filter(a => a.category === cat.value).map(asset => (
+                        <div key={asset.label} className="space-y-1">
+                          <p className="text-[10px] text-gray-500 text-center">{asset.itemLabel}</p>
+                          <AssetCard label={asset.itemLabel} status={asset.status} imgSrc={asset.png_url}
+                            error={asset.error} aspectRatio="1/1"
+                            onClick={() => asset.png_url && setLightbox({ src: asset.png_url, label: `${cat.label} · ${asset.itemLabel}`, prompt: asset.prompt })} />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : <EmptyState icon="🎨" title="UI 에셋 생성" sub="말풍선·버튼·패널·HUD·아이콘을 테마에 맞게 생성합니다" />
           )}
 
           {/* ── Objects tab ── */}

@@ -17,6 +17,7 @@ from services.gif_maker import MOTION_MAKERS
 from services.image_client import ImageClient
 from services.prompt_builder import PromptBuilder
 from services.trend_searcher import TrendSearcher
+from services.ui_builder import UIBuilder, UI_ITEMS
 
 load_dotenv()
 
@@ -39,6 +40,7 @@ prompt_builder = PromptBuilder()
 trend_searcher = TrendSearcher()
 char_builder = CharacterBuilder()
 obj_builder = ObjectBuilder()
+ui_builder = UIBuilder()
 
 
 # ── Pydantic models ──────────────────────────────────────────────────────────
@@ -88,6 +90,16 @@ class ObjGenerationPayload(BaseModel):
     model: str = "gpt-image-1.5"
     size: str = "1024x1024"
     trend_keywords: str = ""
+
+
+class UIGenerationPayload(BaseModel):
+    base_theme: str
+    style_keywords: str = ""
+    api_token: str
+    model: str = "gpt-image-1.5"
+    size: str = "1024x1024"
+    trend_keywords: str = ""
+    ui_categories: list[str] = ["bubble", "button", "panel", "hud", "icon"]
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -355,6 +367,64 @@ async def generate_objects(websocket: WebSocket):
                 )
             except Exception as e:
                 print(f"[OBJ ERROR] {label}: {e}")
+                await websocket.send_json(
+                    {"type": "error", "label": label, "message": f"{type(e).__name__}: {e}"}
+                )
+
+        await websocket.send_json({"type": "complete", "total": done, "session_id": sid})
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+
+
+# ── WebSocket: UI Assets ──────────────────────────────────────────────────────
+
+@app.websocket("/ws/generate-ui")
+async def generate_ui(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        req = UIGenerationPayload(**data)
+
+        sid, sdir = _session_dir("ui")
+
+        jobs = [
+            (category, item)
+            for category in req.ui_categories
+            if category in UI_ITEMS
+            for item in UI_ITEMS[category]
+        ]
+        total = len(jobs)
+        done = 0
+
+        for category, item in jobs:
+            label = f"{category}_{item}"
+            await websocket.send_json(
+                {"type": "progress", "current": done, "total": total, "label": label}
+            )
+            prompt = ui_builder.build(
+                category, item, req.base_theme, req.style_keywords, req.trend_keywords
+            )
+            try:
+                b64 = await image_client.generate(
+                    req.api_token, prompt, req.model, req.size, background="transparent"
+                )
+                fname = f"{label}.png"
+                with open(os.path.join(sdir, fname), "wb") as f:
+                    f.write(base64.b64decode(b64))
+                done += 1
+                await websocket.send_json({
+                    "type": "ui_asset", "label": label,
+                    "category": category, "item": item,
+                    "prompt": prompt, "current": done, "total": total,
+                    "png_url": f"/output/{sid}/{fname}",
+                })
+            except Exception as e:
+                print(f"[UI ERROR] {label}: {e}")
                 await websocket.send_json(
                     {"type": "error", "label": label, "message": f"{type(e).__name__}: {e}"}
                 )
