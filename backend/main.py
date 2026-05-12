@@ -224,6 +224,7 @@ async def generate_characters(websocket: WebSocket):
         motions = [m for m in req.selected_motions if m in MOTION_MAKERS] or ["idle"]
         total = len(jobs) * len(expr_names)
         done = 0
+        sem = asyncio.Semaphore(2)  # max 2 concurrent API calls to avoid 502
 
         for char_type, world in jobs:
             char_label = char_type if world is None else f"enemy_w{world}"
@@ -236,40 +237,41 @@ async def generate_characters(websocket: WebSocket):
                     "label": char_label,
                 })
 
-            # Generate all 6 expressions in parallel
+            # Generate expressions in parallel, max 2 at a time
             async def _gen_expr(
                 expr_name: str,
                 _cl: str = char_label,
                 _ct: str = char_type,
                 _w=world,
             ) -> dict:
-                if _ct == "hero":
-                    prompt = char_builder.hero(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
-                elif _ct == "enemy":
-                    prompt = char_builder.enemy(req.base_theme, _w, req.worlds, req.style_keywords, req.trend_keywords, expr_name)
-                else:
-                    prompt = char_builder.npc(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
+                async with sem:
+                    if _ct == "hero":
+                        prompt = char_builder.hero(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
+                    elif _ct == "enemy":
+                        prompt = char_builder.enemy(req.base_theme, _w, req.worlds, req.style_keywords, req.trend_keywords, expr_name)
+                    else:
+                        prompt = char_builder.npc(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
 
-                b64 = await image_client.generate(req.api_token, prompt, req.model, req.size, background="transparent")
+                    b64 = await image_client.generate(req.api_token, prompt, req.model, req.size, background="transparent")
 
-                png_name = f"{_cl}_{expr_name}.png"
-                with open(os.path.join(sdir, png_name), "wb") as f:
-                    f.write(base64.b64decode(b64))
+                    png_name = f"{_cl}_{expr_name}.png"
+                    with open(os.path.join(sdir, png_name), "wb") as f:
+                        f.write(base64.b64decode(b64))
 
-                gif_urls: dict[str, str] = {}
-                for motion in motions:
-                    maker = MOTION_MAKERS[motion]
-                    kwargs = {"frames": req.gif_frames, "delay_ms": req.gif_delay} if motion == "idle" else {}
-                    gif_bytes = maker(b64, **kwargs)
-                    gif_name = f"{_cl}_{expr_name}_{motion}.gif"
-                    with open(os.path.join(sdir, gif_name), "wb") as f:
-                        f.write(gif_bytes)
-                    gif_urls[motion] = f"/output/{sid}/{gif_name}"
+                    gif_urls: dict[str, str] = {}
+                    for motion in motions:
+                        maker = MOTION_MAKERS[motion]
+                        kwargs = {"frames": req.gif_frames, "delay_ms": req.gif_delay} if motion == "idle" else {}
+                        gif_bytes = maker(b64, **kwargs)
+                        gif_name = f"{_cl}_{expr_name}_{motion}.gif"
+                        with open(os.path.join(sdir, gif_name), "wb") as f:
+                            f.write(gif_bytes)
+                        gif_urls[motion] = f"/output/{sid}/{gif_name}"
 
-                return {
-                    "expr_name": expr_name, "prompt": prompt,
-                    "png_url": f"/output/{sid}/{png_name}", "gif_urls": gif_urls,
-                }
+                    return {
+                        "expr_name": expr_name, "prompt": prompt,
+                        "png_url": f"/output/{sid}/{png_name}", "gif_urls": gif_urls,
+                    }
 
             results = await asyncio.gather(
                 *[_gen_expr(en) for en in expr_names],
