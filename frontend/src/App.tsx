@@ -12,8 +12,9 @@ const BG_SIZES = [
 ]
 
 const CHAR_SIZES = [
-  { label: '1024×1024', value: '1024x1024' },
-  { label: '512×512', value: '512x512' },
+  { label: '1024×1024 (권장)', value: '1024x1024' },
+  { label: '1792×1024 (가로)', value: '1792x1024' },
+  { label: '1024×1792 (세로)', value: '1024x1792' },
 ]
 
 const OBJ_TYPE_LABELS: Record<string, string> = {
@@ -39,13 +40,6 @@ interface BgImage {
   status: 'pending' | 'generating' | 'done' | 'error'; error?: string
 }
 
-// Character types
-interface CharResult {
-  label: string; char_type: string; world: number | null
-  png_url: string | null; gif_urls: Record<string, string>; prompt: string | null
-  status: 'pending' | 'generating' | 'done' | 'error'; error?: string
-}
-
 const EXPRESSIONS = [
   { value: 'neutral',    label: '기본' },
   { value: 'happy',      label: '기쁨' },
@@ -54,6 +48,24 @@ const EXPRESSIONS = [
   { value: 'surprised',  label: '놀람' },
   { value: 'determined', label: '결의' },
 ]
+
+// Character types
+interface ExpressionData {
+  png_url: string; gif_urls: Record<string, string>
+  status: 'pending' | 'generating' | 'done' | 'error'; error?: string
+}
+
+interface CharResult {
+  label: string; char_type: string; world: number | null
+  prompt: string | null; status: 'pending' | 'generating' | 'done' | 'error'; error?: string
+  expressions: Record<string, ExpressionData>
+}
+
+function emptyExpressions(): Record<string, ExpressionData> {
+  return Object.fromEntries(
+    EXPRESSIONS.map(e => [e.value, { png_url: '', gif_urls: {}, status: 'pending' as const }])
+  )
+}
 
 const MOTIONS = [
   { value: 'idle',    label: 'Idle' },
@@ -73,6 +85,24 @@ interface ObjResult {
 
 const idleProgress = (): Progress => ({ current: 0, total: 0, label: '', status: 'idle' })
 
+async function downloadFile(url: string) {
+  const filename = url.split('/').pop() ?? 'download'
+  try {
+    const resp = await fetch(url)
+    const blob = await resp.blob()
+    const blobUrl = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = blobUrl
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(blobUrl)
+  } catch {
+    window.open(url, '_blank')
+  }
+}
+
 function buildBgSlots(worlds: number, stages: number): BgImage[] {
   const imgs: BgImage[] = []
   for (let w = 1; w <= worlds; w++)
@@ -83,10 +113,10 @@ function buildBgSlots(worlds: number, stages: number): BgImage[] {
 
 function buildCharSlots(hero: boolean, enemies: boolean, npc: boolean, worlds: number): CharResult[] {
   const slots: CharResult[] = []
-  if (hero) slots.push({ label: 'hero', char_type: 'hero', world: null, png_url: null, gif_urls: {}, prompt: null, status: 'pending' })
+  if (hero) slots.push({ label: 'hero', char_type: 'hero', world: null, prompt: null, status: 'pending', expressions: emptyExpressions() })
   if (enemies) for (let w = 1; w <= worlds; w++)
-    slots.push({ label: `enemy_w${w}`, char_type: 'enemy', world: w, png_url: null, gif_urls: {}, prompt: null, status: 'pending' })
-  if (npc) slots.push({ label: 'npc', char_type: 'npc', world: null, png_url: null, gif_urls: {}, prompt: null, status: 'pending' })
+    slots.push({ label: `enemy_w${w}`, char_type: 'enemy', world: w, prompt: null, status: 'pending', expressions: emptyExpressions() })
+  if (npc) slots.push({ label: 'npc', char_type: 'npc', world: null, prompt: null, status: 'pending', expressions: emptyExpressions() })
   return slots
 }
 
@@ -124,7 +154,6 @@ export default function App() {
   const [genEnemies, setGenEnemies] = useState(true)
   const [genNpc, setGenNpc] = useState(false)
   const [charSize, setCharSize] = useState('1024x1024')
-  const [charExpression, setCharExpression] = useState('neutral')
   const [selectedMotions, setSelectedMotions] = useState<string[]>(['idle', 'attack', 'jump', 'hurt', 'victory'])
   const [characters, setCharacters] = useState<CharResult[]>([])
   const [charProgress, setCharProgress] = useState<Progress>(idleProgress())
@@ -202,31 +231,44 @@ export default function App() {
     if (!genHero && !genEnemies && !genNpc) { alert('생성할 캐릭터 타입을 선택하세요.'); return }
     setCharacters(buildCharSlots(genHero, genEnemies, genNpc, worlds))
     setCharSessionId(null); setIsGenChar(true)
-    const total = (genHero ? 1 : 0) + (genEnemies ? worlds : 0) + (genNpc ? 1 : 0)
-    setCharProgress({ current: 0, total, label: '', status: 'generating' })
+    const charCount = (genHero ? 1 : 0) + (genEnemies ? worlds : 0) + (genNpc ? 1 : 0)
+    setCharProgress({ current: 0, total: charCount * EXPRESSIONS.length, label: '', status: 'generating' })
     const ws = new WebSocket(`${WS_BASE}/ws/generate-characters`)
     charWs.current = ws
     ws.onopen = () => ws.send(JSON.stringify({
       base_theme: baseTheme, style_keywords: styleKeywords, worlds, api_token: apiToken,
       model: 'gpt-image-1.5', size: charSize, generate_hero: genHero,
       generate_enemies: genEnemies, generate_npc: genNpc, trend_keywords: trendKeywords,
-      expression: charExpression, selected_motions: selectedMotions,
+      selected_motions: selectedMotions,
     }))
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data)
       if (msg.type === 'progress') {
         setCharProgress(p => ({ ...p, current: msg.current, label: msg.label }))
-        setCharacters(prev => prev.map(c => c.label === msg.label ? { ...c, status: 'generating' } : c))
-      } else if (msg.type === 'character') {
+        setCharacters(prev => prev.map(c => c.label !== msg.char_label ? c : {
+          ...c, status: 'generating',
+          expressions: { ...c.expressions, [msg.expression]: { ...c.expressions[msg.expression], status: 'generating' } },
+        }))
+      } else if (msg.type === 'expression') {
         setCharProgress(p => ({ ...p, current: msg.current }))
         const gifUrls: Record<string, string> = {}
         if (msg.gif_urls) for (const [k, v] of Object.entries(msg.gif_urls)) gifUrls[k] = `${API_BASE}${v}`
-        setCharacters(prev => prev.map(c => c.label === msg.label
-          ? { ...c, png_url: `${API_BASE}${msg.png_url}`, gif_urls: gifUrls,
-              prompt: msg.prompt, status: 'done' } : c))
-      } else if (msg.type === 'error' && msg.label) {
-        setCharacters(prev => prev.map(c => c.label === msg.label
-          ? { ...c, status: 'error', error: msg.message } : c))
+        setCharacters(prev => prev.map(c => {
+          if (c.label !== msg.char_label) return c
+          const updatedExprs = {
+            ...c.expressions,
+            [msg.expression]: { png_url: `${API_BASE}${msg.png_url}`, gif_urls: gifUrls, status: 'done' as const },
+          }
+          const allSettled = (Object.values(updatedExprs) as ExpressionData[]).every(ex => ex.status === 'done' || ex.status === 'error')
+          return { ...c, prompt: c.prompt ?? msg.prompt, status: allSettled ? 'done' : 'generating', expressions: updatedExprs }
+        }))
+      } else if (msg.type === 'error' && msg.char_label) {
+        setCharacters(prev => prev.map(c => c.label !== msg.char_label ? c : {
+          ...c, expressions: {
+            ...c.expressions,
+            [msg.expression]: { ...c.expressions[msg.expression], status: 'error', error: msg.message },
+          },
+        }))
       } else if (msg.type === 'complete') {
         setIsGenChar(false); setCharSessionId(msg.session_id)
         setCharProgress(p => ({ ...p, status: 'complete', current: msg.total }))
@@ -234,7 +276,7 @@ export default function App() {
     }
     ws.onerror = () => { setIsGenChar(false); alert('WebSocket 오류.') }
     ws.onclose = () => setIsGenChar(false)
-  }, [apiToken, baseTheme, styleKeywords, worlds, charSize, genHero, genEnemies, genNpc, trendKeywords, charExpression, selectedMotions])
+  }, [apiToken, baseTheme, styleKeywords, worlds, charSize, genHero, genEnemies, genNpc, trendKeywords, selectedMotions])
 
   // ── Object generation ──
   const startObj = useCallback(() => {
@@ -389,19 +431,7 @@ export default function App() {
                   </label>
                 ))}
               </Field>
-              <Field label="표정">
-                <div className="grid grid-cols-3 gap-1">
-                  {EXPRESSIONS.map(ex => (
-                    <button key={ex.value} onClick={() => setCharExpression(ex.value)}
-                      className={`text-xs px-2 py-1.5 rounded border transition-colors ${
-                        charExpression === ex.value
-                          ? 'border-purple-500 bg-purple-900/40 text-purple-300'
-                          : 'border-gray-700 text-gray-500 hover:border-gray-500 hover:text-gray-300'}`}>
-                      {ex.label}
-                    </button>
-                  ))}
-                </div>
-              </Field>
+              <p className="text-[11px] text-gray-600">6개 표정 (기본·기쁨·분노·슬픔·놀람·결의) 자동 생성</p>
               <Field label="모션 GIF">
                 <div className="grid grid-cols-2 gap-1">
                   {MOTIONS.map(m => (
@@ -619,8 +649,8 @@ export default function App() {
             <div className="flex justify-between items-center mb-3">
               <span className="text-purple-400 font-mono font-bold">{lightbox.label}</span>
               <div className="flex gap-2">
-                <a href={lightbox.src} download className="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded text-gray-300 transition-colors"
-                  onClick={e => e.stopPropagation()}>다운로드</a>
+                <button onClick={e => { e.stopPropagation(); downloadFile(lightbox.src) }}
+                  className="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded text-gray-300 transition-colors">다운로드</button>
                 <button onClick={() => setLightbox(null)} className="text-gray-400 hover:text-white text-xl w-8 h-8 flex items-center justify-center">×</button>
               </div>
             </div>
@@ -641,40 +671,83 @@ function CharCard({ c, onLightbox }: {
   c: CharResult
   onLightbox: (lb: { src: string; label: string; prompt?: string | null }) => void
 }) {
-  const motionKeys = Object.keys(c.gif_urls)
-  const [activeMotion, setActiveMotion] = useState<string>(() => motionKeys[0] ?? 'idle')
-  const previewSrc = c.gif_urls[activeMotion] ?? c.png_url
+  const [activeExpr, setActiveExpr] = useState('neutral')
+  const [activeMotion, setActiveMotion] = useState('idle')
+
+  const exprData = c.expressions[activeExpr]
+  const motionKeys = exprData?.status === 'done' ? Object.keys(exprData.gif_urls) : []
+  const previewSrc = exprData?.status === 'done'
+    ? (exprData.gif_urls[activeMotion] ?? exprData.png_url)
+    : null
+  const exprLabel = EXPRESSIONS.find(e => e.value === activeExpr)?.label ?? activeExpr
 
   return (
-    <div className="w-44 space-y-1.5">
-      <p className="text-[10px] text-gray-500 text-center truncate">
-        {c.char_type === 'enemy' && c.world ? `World ${c.world}` : c.char_type.toUpperCase()}
+    <div className="bg-gray-900/40 border border-gray-800 rounded-lg p-3 space-y-3">
+      {/* 헤더 */}
+      <p className="text-[11px] text-gray-500 font-medium">
+        {c.char_type === 'enemy' && c.world ? `Enemy · World ${c.world}` : c.char_type.toUpperCase()}
       </p>
-      <AssetCard label={c.label} status={c.status} imgSrc={previewSrc}
-        error={c.error} aspectRatio="1/1"
-        onClick={() => previewSrc && onLightbox({ src: previewSrc, label: `${c.label} · ${activeMotion}`, prompt: c.prompt })} />
-      {/* Motion tabs */}
-      {c.status === 'done' && motionKeys.length > 1 && (
-        <div className="flex flex-wrap gap-0.5">
-          {motionKeys.map(m => (
-            <button key={m} onClick={() => setActiveMotion(m)}
-              className={`text-[9px] px-1.5 py-0.5 rounded transition-colors ${
-                activeMotion === m ? 'bg-purple-700 text-white' : 'bg-gray-800 text-gray-500 hover:text-gray-300'}`}>
-              {m}
-            </button>
-          ))}
-        </div>
-      )}
-      {/* Download buttons */}
-      {c.status === 'done' && (
-        <div className="flex gap-1">
-          <a href={c.png_url ?? ''} download className="flex-1 text-center text-[9px] bg-gray-800 hover:bg-gray-700 py-1 rounded text-gray-400">PNG</a>
-          {motionKeys.map(m => (
-            <a key={m} href={c.gif_urls[m]} download
-              className="flex-1 text-center text-[9px] bg-gray-800 hover:bg-gray-700 py-1 rounded text-gray-400 truncate">
-              {m}
-            </a>
-          ))}
+
+      {/* 6개 표정 썸네일 */}
+      <div className="grid grid-cols-6 gap-1.5">
+        {EXPRESSIONS.map(ex => {
+          const ed = c.expressions[ex.value]
+          const isActive = activeExpr === ex.value
+          return (
+            <div key={ex.value}
+              onClick={() => { if (ed?.status === 'done') { setActiveExpr(ex.value); setActiveMotion('idle') } }}
+              className={`rounded border-2 overflow-hidden transition-all ${
+                ed?.status === 'done' ? 'cursor-pointer' : 'cursor-default'} ${
+                isActive && ed?.status === 'done' ? 'border-purple-500' : 'border-transparent hover:border-gray-600'}`}>
+              <div className="aspect-square relative bg-gray-950">
+                {ed?.status === 'done' ? (
+                  <img src={ed.png_url} alt={ex.label} className="w-full h-full object-contain" loading="lazy" />
+                ) : ed?.status === 'generating' ? (
+                  <div className="w-full h-full flex items-center justify-center">
+                    <div className="w-2.5 h-2.5 border-2 border-purple-500 border-t-transparent rounded-full animate-spin" />
+                  </div>
+                ) : (
+                  <div className="w-full h-full bg-gray-800/50" />
+                )}
+                <span className="absolute bottom-0 inset-x-0 text-center text-[7px] bg-black/60 text-gray-400 py-0.5 leading-tight">
+                  {ex.label}
+                </span>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      {/* 선택된 표정 상세 (모션 GIF + 다운로드) */}
+      {exprData?.status === 'done' && previewSrc && (
+        <div className="flex gap-3">
+          <div
+            className="w-20 h-20 shrink-0 bg-gray-950 rounded overflow-hidden cursor-pointer border border-gray-800 hover:border-purple-600 transition-colors"
+            onClick={() => onLightbox({ src: previewSrc, label: `${c.label} · ${exprLabel} · ${activeMotion}`, prompt: c.prompt })}>
+            <img src={previewSrc} alt={activeExpr} className="w-full h-full object-contain" />
+          </div>
+          <div className="flex flex-col gap-1.5 min-w-0 flex-1">
+            <p className="text-[10px] text-gray-500">{exprLabel} — {activeMotion}</p>
+            {motionKeys.length > 0 && (
+              <div className="flex flex-wrap gap-0.5">
+                {motionKeys.map(m => (
+                  <button key={m} onClick={() => setActiveMotion(m)}
+                    className={`text-[9px] px-1.5 py-0.5 rounded transition-colors ${
+                      activeMotion === m ? 'bg-purple-700 text-white' : 'bg-gray-800 text-gray-500 hover:text-gray-300'}`}>
+                    {m}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="flex flex-wrap gap-0.5 mt-auto">
+              <button onClick={() => downloadFile(exprData.png_url)}
+                className="text-[9px] bg-gray-800 hover:bg-gray-700 px-1.5 py-0.5 rounded text-gray-400">PNG</button>
+              {motionKeys.map(m => (
+                <button key={m} onClick={() => downloadFile(exprData.gif_urls[m])}
+                  className="text-[9px] bg-gray-800 hover:bg-gray-700 px-1.5 py-0.5 rounded text-gray-400">{m}</button>
+              ))}
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -692,7 +765,7 @@ function CharGroup({ title, chars, onLightbox }: {
         <h2 className="text-sm font-semibold text-gray-300 whitespace-nowrap">{title}</h2>
         <div className="flex-1 h-px bg-gray-800" />
       </div>
-      <div className="flex flex-wrap gap-4">
+      <div className="space-y-3">
         {chars.map(c => <CharCard key={c.label} c={c} onLightbox={onLightbox} />)}
       </div>
     </div>
