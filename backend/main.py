@@ -220,41 +220,59 @@ async def generate_characters(websocket: WebSocket):
         if req.generate_npc:
             jobs.append(("npc", None))
 
-        expr_names = list(EXPRESSIONS.keys())
+        expr_names = list(EXPRESSIONS.keys())  # neutral is first
         motions = [m for m in req.selected_motions if m in MOTION_MAKERS] or ["idle"]
         total = len(jobs) * len(expr_names)
         done = 0
-        sem = asyncio.Semaphore(2)  # max 2 concurrent API calls to avoid 502
 
         for char_type, world in jobs:
             char_label = char_type if world is None else f"enemy_w{world}"
+            base_b64: str | None = None  # neutral image reused as edit source
 
-            # Mark all 6 expressions as generating at once
             for expr_name in expr_names:
                 await websocket.send_json({
                     "type": "progress", "current": done, "total": total,
                     "char_label": char_label, "expression": expr_name,
-                    "label": char_label,
+                    "label": f"{char_label} · {expr_name}",
                 })
 
-            # Generate expressions in parallel, max 2 at a time
-            async def _gen_expr(
-                expr_name: str,
-                _cl: str = char_label,
-                _ct: str = char_type,
-                _w=world,
-            ) -> dict:
-                async with sem:
-                    if _ct == "hero":
-                        prompt = char_builder.hero(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
-                    elif _ct == "enemy":
-                        prompt = char_builder.enemy(req.base_theme, _w, req.worlds, req.style_keywords, req.trend_keywords, expr_name)
+                if char_type == "hero":
+                    neutral_prompt = char_builder.hero(req.base_theme, req.style_keywords, req.trend_keywords, "neutral")
+                elif char_type == "enemy":
+                    neutral_prompt = char_builder.enemy(req.base_theme, world, req.worlds, req.style_keywords, req.trend_keywords, "neutral")
+                else:
+                    neutral_prompt = char_builder.npc(req.base_theme, req.style_keywords, req.trend_keywords, "neutral")
+
+                try:
+                    if base_b64 is None:
+                        b64 = await image_client.generate(
+                            req.api_token, neutral_prompt, req.model, req.size, background="transparent"
+                        )
+                        base_b64 = b64
+                        display_prompt = neutral_prompt
                     else:
-                        prompt = char_builder.npc(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
+                        edit_prompt = char_builder.expression_edit_prompt(expr_name)
+                        try:
+                            # 60s timeout — fail fast if proxy doesn't support edits
+                            b64 = await asyncio.wait_for(
+                                image_client.edit(req.api_token, base_b64, edit_prompt, req.model, req.size),
+                                timeout=60.0,
+                            )
+                            display_prompt = edit_prompt
+                        except Exception as edit_err:
+                            print(f"[EDIT FALLBACK] {char_label}/{expr_name}: {type(edit_err).__name__}")
+                            if char_type == "hero":
+                                fp = char_builder.hero(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
+                            elif char_type == "enemy":
+                                fp = char_builder.enemy(req.base_theme, world, req.worlds, req.style_keywords, req.trend_keywords, expr_name)
+                            else:
+                                fp = char_builder.npc(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
+                            b64 = await image_client.generate(
+                                req.api_token, fp, req.model, req.size, background="transparent"
+                            )
+                            display_prompt = fp
 
-                    b64 = await image_client.generate(req.api_token, prompt, req.model, req.size, background="transparent")
-
-                    png_name = f"{_cl}_{expr_name}.png"
+                    png_name = f"{char_label}_{expr_name}.png"
                     with open(os.path.join(sdir, png_name), "wb") as f:
                         f.write(base64.b64decode(b64))
 
@@ -263,37 +281,25 @@ async def generate_characters(websocket: WebSocket):
                         maker = MOTION_MAKERS[motion]
                         kwargs = {"frames": req.gif_frames, "delay_ms": req.gif_delay} if motion == "idle" else {}
                         gif_bytes = maker(b64, **kwargs)
-                        gif_name = f"{_cl}_{expr_name}_{motion}.gif"
+                        gif_name = f"{char_label}_{expr_name}_{motion}.gif"
                         with open(os.path.join(sdir, gif_name), "wb") as f:
                             f.write(gif_bytes)
                         gif_urls[motion] = f"/output/{sid}/{gif_name}"
 
-                    return {
-                        "expr_name": expr_name, "prompt": prompt,
-                        "png_url": f"/output/{sid}/{png_name}", "gif_urls": gif_urls,
-                    }
-
-            results = await asyncio.gather(
-                *[_gen_expr(en) for en in expr_names],
-                return_exceptions=True,
-            )
-
-            for expr_name, result in zip(expr_names, results):
-                if isinstance(result, Exception):
-                    print(f"[CHAR ERROR] {char_label}/{expr_name}: {result}")
-                    await websocket.send_json({
-                        "type": "error", "char_label": char_label, "expression": expr_name,
-                        "message": f"{type(result).__name__}: {result}",
-                    })
-                else:
                     done += 1
                     await websocket.send_json({
                         "type": "expression",
-                        "char_label": char_label, "expression": result["expr_name"],
-                        "char_type": char_type, "world": world, "prompt": result["prompt"],
+                        "char_label": char_label, "expression": expr_name,
+                        "char_type": char_type, "world": world, "prompt": display_prompt,
                         "current": done, "total": total,
-                        "png_url": result["png_url"],
-                        "gif_urls": result["gif_urls"],
+                        "png_url": f"/output/{sid}/{png_name}",
+                        "gif_urls": gif_urls,
+                    })
+                except Exception as e:
+                    print(f"[CHAR ERROR] {char_label}/{expr_name}: {e}")
+                    await websocket.send_json({
+                        "type": "error", "char_label": char_label, "expression": expr_name,
+                        "message": f"{type(e).__name__}: {e}",
                     })
 
         await websocket.send_json({"type": "complete", "total": done, "session_id": sid})
