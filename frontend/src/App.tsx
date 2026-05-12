@@ -216,7 +216,7 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/api/search-trends`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ theme: baseTheme, genre: 'mobile game' }),
+        body: JSON.stringify({ theme: baseTheme, genre: 'mobile game', api_token: apiToken }),
       })
       setTrendKeywords((await res.json()).keywords)
     } catch { alert('트랜드 검색 실패. 백엔드가 실행 중인지 확인하세요.') }

@@ -1,5 +1,8 @@
-import asyncio
 import os
+
+import httpx
+
+API_BASE = "https://aiproxy-api.backoffice.bagelgames.com"
 
 THEME_KEYWORD_MAP = {
     "fantasy": "painterly fantasy art, epic landscape, trending on artstation, matte painting, soft ambient occlusion, volumetric fog",
@@ -29,25 +32,31 @@ FALLBACK_KEYWORDS = (
 
 
 class TrendSearcher:
-    async def search(self, theme: str, genre: str) -> str:
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        if api_key:
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, self._claude_search, theme, genre, api_key)
+    async def search(self, theme: str, genre: str, api_token: str = "") -> str:
+        if api_token:
+            result = await self._aiproxy_search(theme, genre, api_token)
+            if result:
+                return result
+
+        # Fallback to Anthropic direct API if available
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if anthropic_key:
+            result = await self._anthropic_search(theme, genre, anthropic_key)
             if result:
                 return result
 
         return self._keyword_fallback(theme)
 
-    def _claude_search(self, theme: str, genre: str, api_key: str) -> str:
+    async def _aiproxy_search(self, theme: str, genre: str, api_token: str) -> str:
         try:
-            import anthropic
-
-            client = anthropic.Anthropic(api_key=api_key)
-            response = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=300,
-                messages=[
+            headers = {
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": "gpt-4o-mini",
+                "max_tokens": 300,
+                "messages": [
                     {
                         "role": "user",
                         "content": (
@@ -57,9 +66,44 @@ class TrendSearcher:
                         ),
                     }
                 ],
+            }
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{API_BASE}/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"[TREND aiproxy] {type(e).__name__}: {e}")
+            return ""
+
+    async def _anthropic_search(self, theme: str, genre: str, api_key: str) -> str:
+        try:
+            import anthropic
+            import asyncio
+            client = anthropic.Anthropic(api_key=api_key)
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=300,
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            f"List 12-15 specific visual art style keywords for a {genre} with theme '{theme}'. "
+                            "Focus on 2024-2025 trending game art styles. "
+                            "Output only comma-separated keywords, no explanations, no numbering."
+                        ),
+                    }],
+                )
             )
             return response.content[0].text.strip()
-        except Exception:
+        except Exception as e:
+            print(f"[TREND anthropic] {type(e).__name__}: {e}")
             return ""
 
     def _keyword_fallback(self, theme: str) -> str:

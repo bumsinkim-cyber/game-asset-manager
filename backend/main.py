@@ -48,6 +48,7 @@ ui_builder = UIBuilder()
 class TrendSearchRequest(BaseModel):
     theme: str
     genre: str = "mobile game"
+    api_token: str = ""
 
 
 class BgGenerationPayload(BaseModel):
@@ -130,7 +131,7 @@ async def health():
 
 @app.post("/api/search-trends")
 async def search_trends(request: TrendSearchRequest):
-    keywords = await trend_searcher.search(request.theme, request.genre)
+    keywords = await trend_searcher.search(request.theme, request.genre, request.api_token)
     return {"keywords": keywords}
 
 
