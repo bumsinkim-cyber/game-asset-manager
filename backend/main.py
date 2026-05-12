@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import os
@@ -219,90 +220,78 @@ async def generate_characters(websocket: WebSocket):
         if req.generate_npc:
             jobs.append(("npc", None))
 
-        # neutral must be first so base_b64 is populated before derived expressions
-        expr_names = ["neutral"] + [e for e in EXPRESSIONS.keys() if e != "neutral"]
+        expr_names = list(EXPRESSIONS.keys())
+        motions = [m for m in req.selected_motions if m in MOTION_MAKERS] or ["idle"]
         total = len(jobs) * len(expr_names)
         done = 0
 
         for char_type, world in jobs:
             char_label = char_type if world is None else f"enemy_w{world}"
-            base_b64: str | None = None  # neutral/base image for this character
 
+            # Mark all 6 expressions as generating at once
             for expr_name in expr_names:
                 await websocket.send_json({
                     "type": "progress", "current": done, "total": total,
                     "char_label": char_label, "expression": expr_name,
-                    "label": f"{char_label} · {expr_name}",
+                    "label": char_label,
                 })
 
-                if char_type == "hero":
-                    neutral_prompt = char_builder.hero(req.base_theme, req.style_keywords, req.trend_keywords, "neutral")
-                elif char_type == "enemy":
-                    neutral_prompt = char_builder.enemy(req.base_theme, world, req.worlds, req.style_keywords, req.trend_keywords, "neutral")
+            # Generate all 6 expressions in parallel
+            async def _gen_expr(
+                expr_name: str,
+                _cl: str = char_label,
+                _ct: str = char_type,
+                _w=world,
+            ) -> dict:
+                if _ct == "hero":
+                    prompt = char_builder.hero(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
+                elif _ct == "enemy":
+                    prompt = char_builder.enemy(req.base_theme, _w, req.worlds, req.style_keywords, req.trend_keywords, expr_name)
                 else:
-                    neutral_prompt = char_builder.npc(req.base_theme, req.style_keywords, req.trend_keywords, "neutral")
+                    prompt = char_builder.npc(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
 
-                try:
-                    if base_b64 is None:
-                        # Generate the base character (neutral expression)
-                        b64 = await image_client.generate(
-                            req.api_token, neutral_prompt, req.model, req.size, background="transparent"
-                        )
-                        base_b64 = b64
-                        display_prompt = neutral_prompt
-                    else:
-                        # Derive this expression from the base image via image edit
-                        edit_prompt = char_builder.expression_edit_prompt(expr_name)
-                        try:
-                            b64 = await image_client.edit(
-                                req.api_token, base_b64, edit_prompt, req.model, req.size
-                            )
-                            display_prompt = edit_prompt
-                        except Exception as edit_err:
-                            # Fallback: generate independently if edit API is unavailable
-                            print(f"[EDIT FALLBACK] {char_label}/{expr_name}: {edit_err}")
-                            if char_type == "hero":
-                                fallback_prompt = char_builder.hero(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
-                            elif char_type == "enemy":
-                                fallback_prompt = char_builder.enemy(req.base_theme, world, req.worlds, req.style_keywords, req.trend_keywords, expr_name)
-                            else:
-                                fallback_prompt = char_builder.npc(req.base_theme, req.style_keywords, req.trend_keywords, expr_name)
-                            b64 = await image_client.generate(
-                                req.api_token, fallback_prompt, req.model, req.size, background="transparent"
-                            )
-                            display_prompt = fallback_prompt
+                b64 = await image_client.generate(req.api_token, prompt, req.model, req.size, background="transparent")
 
-                    png_name = f"{char_label}_{expr_name}.png"
-                    with open(os.path.join(sdir, png_name), "wb") as f:
-                        f.write(base64.b64decode(b64))
+                png_name = f"{_cl}_{expr_name}.png"
+                with open(os.path.join(sdir, png_name), "wb") as f:
+                    f.write(base64.b64decode(b64))
 
-                    gif_urls: dict[str, str] = {}
-                    motions = [m for m in req.selected_motions if m in MOTION_MAKERS]
-                    if not motions:
-                        motions = ["idle"]
-                    for motion in motions:
-                        maker = MOTION_MAKERS[motion]
-                        kwargs = {"frames": req.gif_frames, "delay_ms": req.gif_delay} if motion == "idle" else {}
-                        gif_bytes = maker(b64, **kwargs)
-                        gif_name = f"{char_label}_{expr_name}_{motion}.gif"
-                        with open(os.path.join(sdir, gif_name), "wb") as f:
-                            f.write(gif_bytes)
-                        gif_urls[motion] = f"/output/{sid}/{gif_name}"
+                gif_urls: dict[str, str] = {}
+                for motion in motions:
+                    maker = MOTION_MAKERS[motion]
+                    kwargs = {"frames": req.gif_frames, "delay_ms": req.gif_delay} if motion == "idle" else {}
+                    gif_bytes = maker(b64, **kwargs)
+                    gif_name = f"{_cl}_{expr_name}_{motion}.gif"
+                    with open(os.path.join(sdir, gif_name), "wb") as f:
+                        f.write(gif_bytes)
+                    gif_urls[motion] = f"/output/{sid}/{gif_name}"
 
+                return {
+                    "expr_name": expr_name, "prompt": prompt,
+                    "png_url": f"/output/{sid}/{png_name}", "gif_urls": gif_urls,
+                }
+
+            results = await asyncio.gather(
+                *[_gen_expr(en) for en in expr_names],
+                return_exceptions=True,
+            )
+
+            for expr_name, result in zip(expr_names, results):
+                if isinstance(result, Exception):
+                    print(f"[CHAR ERROR] {char_label}/{expr_name}: {result}")
+                    await websocket.send_json({
+                        "type": "error", "char_label": char_label, "expression": expr_name,
+                        "message": f"{type(result).__name__}: {result}",
+                    })
+                else:
                     done += 1
                     await websocket.send_json({
                         "type": "expression",
-                        "char_label": char_label, "expression": expr_name,
-                        "char_type": char_type, "world": world, "prompt": display_prompt,
+                        "char_label": char_label, "expression": result["expr_name"],
+                        "char_type": char_type, "world": world, "prompt": result["prompt"],
                         "current": done, "total": total,
-                        "png_url": f"/output/{sid}/{png_name}",
-                        "gif_urls": gif_urls,
-                    })
-                except Exception as e:
-                    print(f"[CHAR ERROR] {char_label}/{expr_name}: {e}")
-                    await websocket.send_json({
-                        "type": "error", "char_label": char_label, "expression": expr_name,
-                        "message": f"{type(e).__name__}: {e}",
+                        "png_url": result["png_url"],
+                        "gif_urls": result["gif_urls"],
                     })
 
         await websocket.send_json({"type": "complete", "total": done, "session_id": sid})
